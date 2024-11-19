@@ -24,9 +24,16 @@ class ImageEncoder(nn.Module):
             nn.MaxPool3d(kernel_size=(1, 3, 3), stride=(1, 2, 2), padding=(0, 1, 1))
         )
         
+        # チャンネル数を3に変換する層を追加
+        self.channel_conv = nn.Sequential(
+            nn.Conv2d(256, 3, kernel_size=1),
+            nn.BatchNorm2d(3),
+            nn.ReLU(True)
+        )
+        
         # ResNet34 backend
-        resnet = models.resnet34(pretrained=True)
-        self.backend = nn.Sequential(*list(resnet.children())[:-2])  # Remove avgpool and fc
+        resnet = models.resnet34(weights=models.ResNet34_Weights.IMAGENET1K_V1)
+        self.backend = nn.Sequential(*list(resnet.children())[:-2])
         
         # Projection layer
         self.proj = nn.Sequential(
@@ -36,23 +43,29 @@ class ImageEncoder(nn.Module):
         )
         
     def forward(self, x):
-        # x shape: (batch, channel, time, height, width)
+        # x shape: (batch, channel=1, time, height, width)
         b, c, t, h, w = x.size()
         
         # Front-end 3D CNN
-        x = self.front_end(x)
+        x = self.front_end(x)  # (batch, 256, time, h/8, w/8)
         
-        # Reshape for ResNet
-        x = x.transpose(1, 2).contiguous()
-        x = x.view(-1, 256, x.size(3), x.size(4))
+        # Reshape for 2D processing
+        x = x.transpose(1, 2).contiguous()  # (batch, time, 256, h/8, w/8)
+        x = x.view(-1, 256, x.size(3), x.size(4))  # (batch*time, 256, h/8, w/8)
+        
+        # Convert to 3 channels for ResNet
+        x = self.channel_conv(x)  # (batch*time, 3, h/8, w/8)
         
         # Backend ResNet
-        x = self.backend(x)
+        x = self.backend(x)  # (batch*time, 512, h/32, w/32)
         
         # Project to desired dimension
-        x = self.proj(x)
+        x = self.proj(x)  # (batch*time, output_dim, h/32, w/32)
         
-        # Reshape back
-        x = x.view(b, t, -1)  # (batch, time, feature_dim)
+        # Global average pooling
+        x = x.mean([-2, -1])  # (batch*time, output_dim)
+        
+        # Reshape back to sequence
+        x = x.view(b, t, -1)  # (batch, time, output_dim)
         
         return x

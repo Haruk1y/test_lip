@@ -24,23 +24,34 @@ class ModelConfig:
 
 @dataclass
 class TrainingConfig:
-    # Basic training settings
-    batch_size: int = 32
+    # 基本設定
+    batch_size: int = 8  # GPUメモリに応じて調整
     epochs: int = 100
     learning_rate: float = 1e-4
     weight_decay: float = 1e-5
     max_grad_norm: float = 5.0
     
-    # Optimizer settings
+    # オプティマイザー設定
     warmup_steps: int = 1000
     
-    # Device settings
-    device: str = "cuda"
+    # デバイス設定
+    device: str = "cuda" if torch.cuda.is_available() else "cpu"
     multi_gpu: bool = False
     
-    # Data loading
-    num_workers: int = 8
+    # データローディング
+    num_workers: int = 4  # CPU数に応じて調整
     pin_memory: bool = True
+    
+    # モデル設定
+    d_model: int = 512
+    num_encoder_layers: int = 6
+    num_decoder_layers: int = 6
+    num_heads: int = 8
+    dropout: float = 0.1
+    
+    # シーケンス長設定
+    max_vid_length: int = 459  # ROHANの最大フレーム数
+    max_txt_length: int = 200
 
 @dataclass
 class DataConfig:

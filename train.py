@@ -83,7 +83,20 @@ class Trainer:
         )
     
     def train_epoch(self, epoch: int) -> Tuple[float, float]:
-        """Train one epoch"""
+        def validate_lengths(log_probs, targets, input_lengths, target_lengths):
+            """入力とターゲットの長さを検証"""
+            B, T, C = log_probs.size()
+            max_target_length = targets.size(1)
+            
+            print(f"\nSequence length validation:")
+            print(f"- Log probs shape: {log_probs.shape}")
+            print(f"- Targets shape: {targets.shape}")
+            print(f"- Input lengths: {input_lengths}")
+            print(f"- Target lengths: {target_lengths}")
+            
+            if max_target_length < T:
+                print(f"Warning: Target length ({max_target_length}) is less than input length ({T})")
+
         self.model.train()
         total_loss = 0
         total_error_phoneme = 0
@@ -94,20 +107,22 @@ class Trainer:
         pbar = tqdm(train_loader, desc=f'Epoch {epoch}')
         
         for batch in pbar:
-            # Move data to device
+            # データをGPUに転送
             videos = batch['vid'].to(self.device)
             texts = batch['txt'].to(self.device)
             vid_lengths = batch['vid_len'].to(self.device)
             txt_lengths = batch['txt_len'].to(self.device)
             
             # Forward pass
-            self.optimizer.zero_grad()
             logits = self.model(videos)
             
-            # Compute CTC loss
+            # Loss計算
             log_probs = torch.log_softmax(logits, dim=-1)
+            # Validate lengths on first batch
+            if num_batches == 0:
+                validate_lengths(log_probs, texts, vid_lengths, txt_lengths)
             loss = self.criterion(
-                log_probs.transpose(0, 1),  # (T, N, C)
+                log_probs.transpose(0, 1),
                 texts,
                 vid_lengths,
                 txt_lengths
@@ -118,37 +133,56 @@ class Trainer:
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.max_grad_norm)
             self.optimizer.step()
             self.scheduler.step()
+            self.optimizer.zero_grad()
             
-            # Compute metrics
+            # メトリクスの計算
             with torch.no_grad():
-                predictions = self.tokenizer.decode_ctc(logits)
-                targets = [self.tokenizer.decode(txt[:length]) 
-                          for txt, length in zip(texts.cpu().numpy(), txt_lengths.cpu().numpy())]
-                
-                error_phoneme = compute_error_rate(predictions, targets, level='phoneme')
-                error_mora = compute_error_rate(predictions, targets, level='mora')
+                try:
+                    # バッチ内の各サンプルに対してデコード
+                    predictions = []
+                    targets = []
+                    
+                    for i in range(logits.size(0)):
+                        sample_logits = logits[i:i+1]  # (1, T, C)
+                        pred = self.tokenizer.decode_ctc(sample_logits)
+                        predictions.append(pred)
+                        
+                        target_length = txt_lengths[i].item()
+                        target = texts[i, :target_length].cpu().numpy()
+                        target = self.tokenizer.decode(target)
+                        targets.append(target)
+                    
+                    # エラー率の計算
+                    error_phoneme = compute_error_rate(predictions, targets, level='phoneme')
+                    error_mora = compute_error_rate(predictions, targets, level='mora')
+                    
+                    # デバッグ情報（最初のバッチのみ）
+                    if num_batches == 0:
+                        print("\nFirst batch debug info:")
+                        print(f"Predictions: {predictions[0][:10]}")
+                        print(f"Targets: {targets[0][:10]}")
+                    
+                except Exception as e:
+                    print(f"\nError in metrics calculation: {str(e)}")
+                    print(f"Logits shape: {logits.shape}")
+                    print(f"Logits device: {logits.device}")
+                    raise
             
             total_loss += loss.item()
             total_error_phoneme += error_phoneme
             total_error_mora += error_mora
             num_batches += 1
             
-            # Update progress bar
             pbar.set_postfix({
                 'loss': f'{loss.item():.4f}',
                 'ph_err': f'{error_phoneme:.4f}',
                 'mora_err': f'{error_mora:.4f}'
             })
         
-        # Compute average metrics
+        # 平均メトリクスの計算
         avg_loss = total_loss / num_batches
         avg_error_phoneme = total_error_phoneme / num_batches
         avg_error_mora = total_error_mora / num_batches
-        
-        # Log metrics
-        self.writer.add_scalar('train/loss', avg_loss, epoch)
-        self.writer.add_scalar('train/error_phoneme', avg_error_phoneme, epoch)
-        self.writer.add_scalar('train/error_mora', avg_error_mora, epoch)
         
         return avg_loss, avg_error_phoneme, avg_error_mora
     
@@ -266,7 +300,7 @@ def main():
     parser.add_argument('--lab_dir', type=str, required=True)
     parser.add_argument('--landmark_dir', type=str, required=True)
     parser.add_argument('--vid_padding', type=int, default=200)
-    parser.add_argument('--txt_padding', type=int, default=200)
+    parser.add_argument('--txt_padding', type=int, default=459)  # CTCの要件に合わせて増加xs
     
     # Other configuration
     parser.add_argument('--num_workers', type=int, default=8)

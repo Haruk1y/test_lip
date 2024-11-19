@@ -1,5 +1,6 @@
 import numpy as np
 from typing import List, Dict, Optional
+import torch
 
 class JapanesePhonemeTokenizer:
     def __init__(self):
@@ -17,7 +18,7 @@ class JapanesePhonemeTokenizer:
         # 特殊トークン
         self.pad_idx = len(self.phonemes)  # パディング用
         self.blank_idx = self.pad_idx + 1  # CTCブランク用
-        
+    
     def encode(self, phoneme_sequence: List[str]) -> np.ndarray:
         """音素列をインデックス列に変換"""
         return np.array([self.phoneme2idx[p] for p in phoneme_sequence])
@@ -26,31 +27,32 @@ class JapanesePhonemeTokenizer:
         """インデックス列を音素列に変換"""
         return [self.idx2phoneme[i] for i in index_sequence if i < self.pad_idx]
     
-    def decode_ctc(self, logits: np.ndarray) -> List[str]:
+    def decode_ctc(self, logits) -> List[str]:
         """CTCデコーディング (最大確率の音素を選択)"""
-        pred_indices = np.argmax(logits, axis=1)
+        # GPU テンソルを CPU に移動してから numpy に変換
+        if torch.is_tensor(logits):
+            logits = logits.detach().cpu().numpy()
+        
+        # バッチの最初のサンプルを取得（バッチサイズ1の場合）
+        if len(logits.shape) == 3:
+            logits = logits[0]  # (T, C)
+            
+        pred_indices = np.argmax(logits, axis=-1)  # (T,)
         decoded = []
         prev = -1
-        for idx in pred_indices:
-            if idx != prev and idx != self.blank_idx and idx < self.pad_idx:
+        
+        # 各時間ステップの予測を処理
+        for t in range(len(pred_indices)):
+            idx = pred_indices[t]
+            if (idx != prev and 
+                idx != self.blank_idx and 
+                idx < self.pad_idx):
                 decoded.append(self.idx2phoneme[idx])
             prev = idx
+            
         return decoded
     
     @property
     def num_classes(self) -> int:
         """音素数 + パディング + CTCブランク"""
         return len(self.phonemes) + 2
-
-    def parse_lab_file(self, lab_file: str) -> List[Dict]:
-        """LABファイルを解析して音素列と時間情報を取得"""
-        phonemes = []
-        with open(lab_file, 'r') as f:
-            for line in f:
-                start, end, phoneme = line.strip().split()
-                phonemes.append({
-                    'phoneme': phoneme,
-                    'start': int(start),
-                    'end': int(end)
-                })
-        return phonemes

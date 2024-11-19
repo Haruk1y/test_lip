@@ -1,130 +1,110 @@
 import torch
 from torch.utils.data import Dataset
 import numpy as np
+from pathlib import Path
+from typing import Dict, Any
 import cv2
-import os
-from typing import Dict, Any, Tuple
-import pandas as pd
 
 class ROHANDataset(Dataset):
-    def __init__(self, 
+    def __init__(self,
                  video_dir: str,
                  lab_dir: str,
                  landmark_dir: str,
                  file_list: str,
-                 tokenizer: JapanesePhonemeTokenizer,
-                 vid_padding: int = 200,
-                 txt_padding: int = 200,
-                 phase: str = 'train'):
+                 tokenizer,
+                 vid_padding: int = 459,  # ROHANの最大フレーム数
+                 txt_padding: int = 459,
+                 phase: str = 'train',
+                 target_size: tuple = (96, 96)):
         """
         Args:
-            video_dir: 動画ファイルのディレクトリ
+            video_dir: 処理済み動画データのディレクトリ
             lab_dir: LABファイルのディレクトリ
-            landmark_dir: ランドマークCSVのディレクトリ
+            landmark_dir: ランドマークデータのディレクトリ
             file_list: ファイルリスト
             tokenizer: 音素トークナイザー
             vid_padding: ビデオパディング長
             txt_padding: テキストパディング長
-            phase: 'train' or 'val'
+            phase: 'train' or 'val' or 'test'
         """
-        self.video_dir = video_dir
-        self.lab_dir = lab_dir
-        self.landmark_dir = landmark_dir
+        self.video_dir = Path(video_dir)
+        self.lab_dir = Path(lab_dir)
+        self.landmark_dir = Path(landmark_dir)
         self.tokenizer = tokenizer
         self.vid_padding = vid_padding
         self.txt_padding = txt_padding
         self.phase = phase
+        self.target_size = target_size
         
         # ファイルリストの読み込み
         with open(file_list, 'r') as f:
             self.files = [line.strip() for line in f.readlines()]
-            
+
+        # npzファイルのディレクトリ（data/train/やdata/val/）
+        self.npz_dir = Path("data") / phase
+    
+    def _resize_frames(self, frames: np.ndarray) -> np.ndarray:
+        """フレームのリサイズ処理"""
+        h, w = self.target_size
+        resized = []
+        for frame in frames:
+            frame = cv2.resize(frame, (w, h), interpolation=cv2.INTER_AREA)
+            resized.append(frame)
+        return np.array(resized)
+
     def __len__(self) -> int:
         return len(self.files)
     
-    def _load_video(self, video_path: str) -> np.ndarray:
-        """動画の読み込みと前処理"""
-        cap = cv2.VideoCapture(video_path)
-        frames = []
-        while cap.isOpened():
-            ret, frame = cap.read()
-            if not ret:
-                break
-            # グレースケール変換
-            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            # リサイズ (128x64に統一)
-            frame = cv2.resize(frame, (128, 64))
-            frames.append(frame)
-        cap.release()
-        
-        return np.array(frames)
-    
-    def _load_landmarks(self, csv_path: str) -> np.ndarray:
-        """ランドマークの読み込み"""
-        df = pd.read_csv(csv_path)
-        return df.values
-    
-    def _align_phonemes(self, phoneme_info: List[Dict], video_frames: int,
-                       fps: float = 29.95) -> List[str]:
-        """音素を動画フレームに合わせてアライメント"""
-        frame_phonemes = []
-        current_frame = 0
-        
-        for frame_idx in range(video_frames):
-            time_ns = int(frame_idx * (1e9 / fps))  # フレーム番号を時間(ns)に変換
-            
-            # 現在の時刻に対応する音素を探す
-            current_phoneme = 'sil'  # デフォルトは無音
-            for info in phoneme_info:
-                if info['start'] <= time_ns <= info['end']:
-                    current_phoneme = info['phoneme']
-                    break
-            frame_phonemes.append(current_phoneme)
-            
-        return frame_phonemes
+    def _load_data(self, npz_path: Path) -> Dict[str, np.ndarray]:
+        """処理済みデータの読み込み"""
+        data = np.load(npz_path)
+        return {key: data[key] for key in data.files}
     
     def _padding(self, array: np.ndarray, length: int) -> np.ndarray:
         """配列をパディング"""
         if array.shape[0] > length:
             return array[:length]
         else:
-            pad_width = [(0, length - array.shape[0])] + \
-                       [(0, 0) for _ in range(len(array.shape) - 1)]
-            return np.pad(array, pad_width, mode='constant')
+            pad_width = [(0, length - array.shape[0])]
+            if len(array.shape) > 1:
+                pad_width.extend((0, 0) for _ in range(len(array.shape) - 1))
+            return np.pad(array, pad_width, mode='constant', constant_values=0)
     
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         file_id = self.files[idx]
+        npz_path = self.npz_dir / f"{file_id}.npz"
         
-        # 各ファイルパスの構築
-        video_path = os.path.join(self.video_dir, f"LFROI_{file_id}.mp4")
-        lab_path = os.path.join(self.lab_dir, f"{file_id}.lab")
-        landmark_path = os.path.join(self.landmark_dir, f"{file_id}_points.csv")
+        try:
+            data = self._load_data(npz_path)
+        except FileNotFoundError:
+            print(f"File not found: {npz_path}")
+            raise
         
-        # データの読み込み
-        video = self._load_video(video_path)
-        phoneme_info = self.tokenizer.parse_lab_file(lab_path)
-        landmarks = self._load_landmarks(landmark_path)
+        frames = data['frames']  # (T, H, W)
+        phonemes = data['phonemes']
         
-        # 音素のアライメント
-        frame_phonemes = self._align_phonemes(phoneme_info, len(video))
-        phoneme_indices = self.tokenizer.encode(frame_phonemes)
-        
-        # パディング
-        video = self._padding(video, self.vid_padding)
+         # フレームのリサイズ
+        frames = self._resize_frames(frames)
+
+        # メモリ効率の良い処理
+        frames = self._padding(frames, self.vid_padding)
+        phoneme_indices = self.tokenizer.encode(phonemes)
         phoneme_indices = self._padding(phoneme_indices, self.txt_padding)
+
+        # パディング後の長さを確認
+        if len(phoneme_indices) > self.txt_padding:
+            print(f"Warning: Sequence length {len(phoneme_indices)} exceeds padding {self.txt_padding}")
         
-        # データ拡張（学習時のみ）
-        if self.phase == 'train':
-            if np.random.random() < 0.5:
-                video = video[:, :, ::-1]  # 水平反転
+        if self.phase == 'train' and np.random.random() < 0.5:
+            frames = np.ascontiguousarray(frames[:, ::-1])
         
-        # チャンネル次元の追加とテンソル変換
-        video = np.expand_dims(video, axis=1)  # (T, 1, H, W)
-        video = video / 255.0  # 正規化
+        ## 正規化とチャンネル次元の追加
+        frames = frames.astype(np.float32) / 255.0
+        frames = np.expand_dims(frames, axis=0)  # (1, T, H, W)
         
         return {
-            'vid': torch.FloatTensor(video),
-            'txt': torch.LongTensor(phoneme_indices),
-            'vid_len': torch.LongTensor([len(video)]),
-            'txt_len': torch.LongTensor([len(frame_phonemes)])
+            'vid': torch.from_numpy(frames).float(),  # shape: (1, T, H, W)
+            'txt': torch.from_numpy(phoneme_indices).long(),
+            'vid_len': torch.tensor([frames.shape[1]], dtype=torch.long),
+            'txt_len': torch.tensor([len(phonemes)], dtype=torch.long)
         }

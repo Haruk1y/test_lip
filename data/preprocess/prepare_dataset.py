@@ -1,164 +1,131 @@
-import argparse
-import shutil
-import random
-import time
-from pathlib import Path
-from typing import List, Tuple
+import cv2
+import numpy as np
 import pandas as pd
+from pathlib import Path
 from tqdm import tqdm
+import json
+import torch
+from typing import List, Dict, Tuple
 
-def get_file_ids(video_dir: Path) -> List[str]:
-    """Get all file IDs from video directory"""
-    video_files = sorted(video_dir.glob("LFROI_*.mp4"))
-    return [f.stem.replace("LFROI_", "") for f in video_files]
-
-def split_dataset(
-    file_ids: List[str],
-    train_ratio: float,
-    val_ratio: float,
-    test_ratio: float
-) -> Tuple[List[str], List[str], List[str]]:
-    """Split file IDs into train, validation and test sets"""
-    assert abs(train_ratio + val_ratio + test_ratio - 1.0) < 1e-5
+def process_video(video_path: Path, output_dir: Path) -> List[np.ndarray]:
+    """動画をフレームに分割して保存"""
+    cap = cv2.VideoCapture(str(video_path))
+    frames = []
     
-    random.shuffle(file_ids)
-    total = len(file_ids)
-    
-    train_size = int(total * train_ratio)
-    val_size = int(total * val_ratio)
-    
-    train_ids = file_ids[:train_size]
-    val_ids = file_ids[train_size:train_size + val_size]
-    test_ids = file_ids[train_size + val_size:]
-    
-    return train_ids, val_ids, test_ids
-
-def safe_copy(src_file: Path, dst_file: Path, max_retries: int = 3, retry_delay: float = 1.0):
-    """Safely copy file with retries"""
-    for attempt in range(max_retries):
-        try:
-            shutil.copy2(src_file, dst_file)
-            return True
-        except (BlockingIOError, OSError) as e:
-            if attempt == max_retries - 1:
-                print(f"\nFailed to copy {src_file} to {dst_file} after {max_retries} attempts: {str(e)}")
-                return False
-            time.sleep(retry_delay * (attempt + 1))  # Exponential backoff
-    return False
-
-def copy_files(
-    file_ids: List[str],
-    src_dir: Path,
-    dst_dir: Path,
-    file_pattern: str,
-    desc: str,
-    chunk_size: int = 100  # Process files in smaller chunks
-):
-    """Copy files from source to destination directory with chunking"""
-    dst_dir.mkdir(parents=True, exist_ok=True)
-    
-    # Process files in chunks
-    for i in range(0, len(file_ids), chunk_size):
-        chunk = file_ids[i:i + chunk_size]
-        for file_id in tqdm(chunk, desc=f"Copying {desc} ({i}-{i+len(chunk)}/{len(file_ids)})"):
-            src_file = src_dir / file_pattern.format(file_id)
-            dst_file = dst_dir / file_pattern.format(file_id)
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret:
+            break
             
-            if not src_file.exists():
-                print(f"\nWarning: File not found - {src_file}")
-                continue
-                
-            if dst_file.exists():
-                continue  # Skip if already copied
-                
-            if not safe_copy(src_file, dst_file):
-                print(f"\nSkipping file: {file_id}")
-                continue
-                
-        # Small delay between chunks to prevent I/O overload
-        time.sleep(0.1)
+        # グレースケール変換
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        
+        # 正規化
+        normalized = gray.astype(np.float32) / 255.0
+        
+        frames.append(normalized)
+    
+    cap.release()
+    return frames
 
-def main():
-    parser = argparse.ArgumentParser(description="Prepare ROHAN dataset")
-    parser.add_argument("--data_dir", type=Path, required=True, help="Path to raw data directory")
-    parser.add_argument("--output_dir", type=Path, required=True, help="Path to output directory")
-    parser.add_argument("--splits_dir", type=Path, required=True, help="Path to splits directory")
-    parser.add_argument("--train_ratio", type=float, default=0.8, help="Training set ratio")
-    parser.add_argument("--val_ratio", type=float, default=0.1, help="Validation set ratio")
-    parser.add_argument("--test_ratio", type=float, default=0.1, help="Test set ratio")
-    parser.add_argument("--seed", type=int, default=42, help="Random seed")
-    parser.add_argument("--chunk_size", type=int, default=100, help="Number of files to process in each chunk")
-    args = parser.parse_args()
+def parse_lab_file(lab_path: Path) -> List[Dict[str, int]]:
+    """LABファイルを解析して音素情報を抽出"""
+    phonemes = []
+    with open(lab_path, 'r') as f:
+        for line in f:
+            line = line.strip()
+            if not line:  # 空行をスキップ
+                continue
+            start, end, phoneme = line.split()
+            phonemes.append({
+                'start': int(start),
+                'end': int(end),
+                'phoneme': phoneme
+            })
+    return phonemes
+
+def align_phonemes_to_frames(phonemes: List[Dict], num_frames: int, fps: float = 29.95) -> List[str]:
+    """音素情報をフレームに合わせてアライメント"""
+    frame_phonemes = []
+    ns_per_frame = int(1e9 / fps)
     
-    # Set random seed
-    random.seed(args.seed)
-    
-    # Ensure directories exist
-    args.output_dir.mkdir(parents=True, exist_ok=True)
-    args.splits_dir.mkdir(parents=True, exist_ok=True)
-    
-    # Get all file IDs
-    file_ids = get_file_ids(args.data_dir / "videos")
-    print(f"Total number of samples: {len(file_ids)}")
-    
-    # Split dataset
-    train_ids, val_ids, test_ids = split_dataset(
-        file_ids,
-        args.train_ratio,
-        args.val_ratio,
-        args.test_ratio
-    )
-    
-    print(f"Train set size: {len(train_ids)}")
-    print(f"Validation set size: {len(val_ids)}")
-    print(f"Test set size: {len(test_ids)}")
-    
-    # Create splits files
-    for split_name, split_ids in [
-        ("train", train_ids),
-        ("val", val_ids),
-        ("test", test_ids)
-    ]:
-        with open(args.splits_dir / f"{split_name}_list.txt", "w") as f:
-            f.write("\n".join(split_ids))
-    
-    # Copy files for each split
-    for split_name, split_ids in [
-        ("train", train_ids),
-        ("val", val_ids),
-        ("test", test_ids)
-    ]:
-        print(f"\nProcessing {split_name} split...")
+    for frame_idx in range(num_frames):
+        time_ns = frame_idx * ns_per_frame
         
-        # Copy videos
-        copy_files(
-            split_ids,
-            args.data_dir / "videos",
-            args.output_dir / split_name / "videos",
-            "LFROI_{}.mp4",
-            f"{split_name} videos",
-            args.chunk_size
-        )
+        # デフォルトは無音
+        current_phoneme = 'sil'
         
-        # Copy lab files
-        copy_files(
-            split_ids,
-            args.data_dir / "lab",
-            args.output_dir / split_name / "lab",
-            "{}.lab",
-            f"{split_name} lab files",
-            args.chunk_size
-        )
+        # 現在のフレーム時刻に対応する音素を探す
+        for p in phonemes:
+            if p['start'] <= time_ns < p['end']:
+                current_phoneme = p['phoneme']
+                break
+                
+        frame_phonemes.append(current_phoneme)
+    
+    return frame_phonemes
+
+def process_landmarks(landmarks_path: Path) -> np.ndarray:
+    """ランドマークCSVを読み込んで処理"""
+    df = pd.read_csv(landmarks_path)
+    # 必要な座標のみを抽出 (口周りのランドマーク)
+    lip_indices = [
+        *range(0, 17),      # Jaw line
+        *range(48, 68),     # Mouth
+    ]
+    landmarks = df.iloc[:, lip_indices].values
+    return landmarks
+
+def prepare_dataset(
+    data_dir: Path,
+    output_dir: Path,
+    split: str,
+    max_seq_length: int = 459  # ROHANの最大フレーム数
+):
+    """データセットの準備"""
+    videos_dir = data_dir / split / "videos"
+    lab_dir = data_dir / split / "lab"
+    landmarks_dir = data_dir / split / "landmarks"
+    
+    # 出力ディレクトリの作成
+    processed_dir = output_dir / split
+    processed_dir.mkdir(parents=True, exist_ok=True)
+    
+    # 各ビデオを処理
+    video_files = sorted(list(videos_dir.glob("*.mp4")))
+    
+    for video_path in tqdm(video_files, desc=f"Processing {split} data"):
+        video_id = video_path.stem.replace("LFROI_", "")
         
-        # Copy landmark files
-        copy_files(
-            split_ids,
-            args.data_dir / "landmarks",
-            args.output_dir / split_name / "landmarks",
-            "{}_points.csv",
-            f"{split_name} landmark files",
-            args.chunk_size
+        # 関連ファイルのパスを構築
+        lab_path = lab_dir / f"{video_id}.lab"
+        landmarks_path = landmarks_dir / f"{video_id}_points.csv"
+        
+        # 各データの処理
+        frames = process_video(video_path, processed_dir)
+        phonemes = parse_lab_file(lab_path)
+        landmarks = process_landmarks(landmarks_path)
+        
+        # フレームと音素のアライメント
+        frame_phonemes = align_phonemes_to_frames(phonemes, len(frames))
+        
+        # データの保存
+        save_path = processed_dir / f"{video_id}.npz"
+        np.savez_compressed(
+            save_path,
+            frames=np.array(frames),
+            phonemes=np.array(frame_phonemes),
+            landmarks=landmarks
         )
 
 if __name__ == "__main__":
-    main()
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--data_dir", type=Path, required=True)
+    parser.add_argument("--output_dir", type=Path, required=True)
+    args = parser.parse_args()
+    
+    # 訓練データと検証データの準備
+    prepare_dataset(args.data_dir, args.output_dir, "train")
+    prepare_dataset(args.data_dir, args.output_dir, "val")
+    prepare_dataset(args.data_dir, args.output_dir, "test")
